@@ -19,7 +19,6 @@
     .progress { height:10px; background:#eee; border-radius:999px; overflow:hidden; margin-top:8px; }
     .bar { height:100%; width:0%; background:#4f46e5; transition: width .2s ease; }
     pre#log { background:#0b1020; color:#d6e1ff; padding:10px; border-radius:8px; height:180px; overflow:auto; font-size:12px; }
-    .inline { display:flex; gap:8px; align-items:center; }
   </style>
 </head>
 <body>
@@ -61,16 +60,8 @@
     </div>
   </div>
 
-  <div class="row" style="margin-top:12px;">
-    <div>
-      <label>do-not-translate 패턴 (정규식, 쉼표로 구분)</label>
-      <input id="dnt" placeholder="예: https?:\/\/\S+, [A-Z]{2,}, \$\w+, \{\{[^}]+\}\}" />
-    </div>
-    <div>
-      <label>Azure Region (선택)</label>
-      <input id="azureRegion" placeholder="예: koreacentral" />
-    </div>
-  </div>
+  <label style="margin-top:12px;">do-not-translate 패턴 (선택, 정규식·쉼표 구분)</label>
+  <input id="dnt" placeholder="비워도 됩니다. 예) https?:\/\/\S+, [A-Z]{2,}, \$\w+, \{\{[^}]+\}\}" />
 
   <label>글로서리 (선택, JSON)</label>
   <textarea id="glossary" rows="3" placeholder='{"후원":"donation","정기후원":"monthly pledge"}'></textarea>
@@ -85,21 +76,20 @@
   </div>
 
   <div class="progress"><div class="bar" id="bar"></div></div>
-  <div class="inline" style="justify-content:space-between;">
-    <div class="hint" id="meter">0 / 0</div>
-    <button id="testProxyBtn" style="width:auto;">프록시 테스트</button>
-  </div>
+  <div class="hint" id="meter" style="text-align:right;">0 / 0</div>
 
   <label style="margin-top:12px;">상태 로그</label>
   <pre id="log"></pre>
 
   <div class="row" style="margin-top:12px;">
     <button id="downloadBtn" disabled>번역된 파일 다운로드</button>
+    <button id="testProxyBtn">프록시 테스트</button>
   </div>
 </div>
 
 <script>
-  // === 반드시 본인 워커 주소로 교체 ===
+  // === 꼭 본인 Cloudflare Worker 주소로 교체 ===
+  // /translate 붙일 필요 없습니다. Cloudflare가 알려준 주소 그대로 OK.
   const proxyURL = "https://drawiotranslator.eyseong.workers.dev/";
 
   const statusEl = document.getElementById('status');
@@ -115,7 +105,6 @@
   const targetLangEl = document.getElementById('targetLang');
   const dntEl = document.getElementById('dnt');
   const glossaryEl = document.getElementById('glossary');
-  const azureRegionEl = document.getElementById('azureRegion');
 
   const bar = document.getElementById('bar');
   const meter = document.getElementById('meter');
@@ -124,6 +113,10 @@
   let originalXmlText = null;
   let translatedXmlText = null;
   let aborter = null;
+
+  // 전역 에러도 화면에 찍기
+  window.addEventListener('error', (e) => log(`[window.error] ${e.message}`));
+  window.addEventListener('unhandledrejection', (e) => log(`[promise.reject] ${e.reason}`));
 
   // 세션 저장/복원
   apiKeyEl.value = sessionStorage.getItem('DRAWIO_TR_KEY') || '';
@@ -136,19 +129,15 @@
     status("파일 로드 완료");
   });
 
+  // 프록시/키 간단 점검
   testProxyBtn.addEventListener('click', async () => {
     try {
+      if (!/^https?:\/\//i.test(proxyURL)) return status("proxyURL이 비어있습니다. 먼저 설정하세요.", true);
       const apiKey = apiKeyEl.value.trim();
       if (!apiKey) return status("API 키를 먼저 입력하세요", true);
-      const body = {
-        provider: providerEl.value,
-        apiKey,
-        source: "KO",
-        target: "EN",
-        q: "안녕하세요",
-        region: azureRegionEl.value.trim() || undefined
-      };
-      const res = await fetch(proxyURL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+
+      const body = { provider: providerEl.value, apiKey, source: "KO", target: "EN", q: "안녕하세요" };
+      const res = await fetchWithTimeout(proxyURL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }, 15000);
       const txt = await res.text();
       log(`[TEST] status=${res.status} body=${txt}`);
       if (!res.ok) status("프록시/키 점검 필요: " + txt, true);
@@ -162,6 +151,7 @@
   translateBtn.addEventListener('click', async () => {
     resetProgress();
     try {
+      if (!/^https?:\/\//i.test(proxyURL)) return status("proxyURL이 비어있거나 잘못되었습니다. Worker 주소를 먼저 넣어주세요.", true);
       if (!originalXmlText) return status("파일을 먼저 업로드하세요", true);
 
       const apiKey = apiKeyEl.value.trim();
@@ -178,11 +168,11 @@
       const diagrams = Array.from(doc.getElementsByTagName('diagram'));
       if (diagrams.length === 0) return status("diagram 노드를 찾지 못했습니다.", true);
 
-      const dntRegexes = parseRegexList(dntEl.value);
+      const dntRegexes = parseRegexList(dntEl.value); // 비어 있어도 OK
       const glossary = tryParseJSON(glossaryEl.value) || {};
 
-      // 전체 처리할 라벨 수 카운트
-      const toTranslate = [];
+      // 번역 대상 수집
+      const tasks = [];
       for (const diagram of diagrams) {
         const innerXml = inflateIfNeeded(diagram.textContent || '');
         const innerDoc = parser.parseFromString(innerXml, "text/xml");
@@ -192,43 +182,35 @@
           if (!rawVal) continue;
           const plain = htmlToPlainText(decodeHtmlEntities(rawVal)).trim();
           if (!plain) continue;
-          toTranslate.push({ diagram, innerXml, innerDoc, cell });
+          tasks.push({ diagram, innerDoc, cell });
         }
       }
-      const total = toTranslate.length;
-      let done = 0;
-      updateMeter(done, total);
 
-      // 실제 변환: diagram 단위로 다시 열어 재주입
-      let curDiagram = null, serializer = new XMLSerializer();
-      for (let i = 0; i < toTranslate.length; i++) {
+      const total = tasks.length;
+      let done = 0; updateMeter(done, total);
+
+      // 실행
+      for (const t of tasks) {
         if (aborter.signal.aborted) throw new Error('사용자 취소');
-        const item = toTranslate[i];
-        if (item.diagram !== curDiagram && curDiagram) {
-          // 직전 diagram 저장/압축
-          const prevDoc = toTranslate[i-1].innerDoc;
-          const newInner = serializer.serializeToString(prevDoc.documentElement);
-          item.diagram.previousSibling?.textContent; // no-op
-        }
-        curDiagram = item.diagram;
 
-        const rawVal = item.cell.getAttribute('value');
+        const rawVal = t.cell.getAttribute('value');
         const htmlDecoded = decodeHtmlEntities(rawVal);
         const plainText = htmlToPlainText(htmlDecoded).trim();
 
         const {protectedText, placeholders} = protectTokens(plainText, dntRegexes);
         const glApplied = applyGlossaryBefore(protectedText, glossary);
-        const translated = await translateText(glApplied, sourceLangEl.value, targetLangEl.value, providerEl.value, apiKey, azureRegionEl.value.trim(), aborter.signal);
+        const translated = await translateText(glApplied, sourceLangEl.value, targetLangEl.value, providerEl.value, apiKey, aborter.signal);
         const restored = restoreTokens(applyGlossaryAfter(translated, glossary), placeholders);
-        item.cell.setAttribute('value', encodeHtmlEntities(restored));
+
+        t.cell.setAttribute('value', encodeHtmlEntities(restored));
 
         done++; updateMeter(done, total);
-        if (i % 10 === 0) log(`진행: ${done}/${total}`);
+        if (done % 10 === 0) log(`진행: ${done}/${total}`);
       }
 
-      // diagram별로 재압축 후 반영
+      // diagram별 반영
       const byDiagram = new Map();
-      for (const t of toTranslate) {
+      for (const t of tasks) {
         if (!byDiagram.has(t.diagram)) byDiagram.set(t.diagram, t.innerDoc);
       }
       for (const [diagram, innerDoc] of byDiagram.entries()) {
@@ -252,7 +234,11 @@
   });
 
   cancelBtn.addEventListener('click', () => {
-    if (aborter) aborter.abort();
+    if (aborter) {
+      aborter.abort();
+      status("취소 요청됨(잠시 후 중단).", true);
+      log("[USER] Abort requested");
+    }
   });
 
   downloadBtn.addEventListener('click', () => {
@@ -283,11 +269,20 @@
   function encodeHtmlEntities(s){ const e=document.createElement('textarea'); e.textContent=s; return e.innerHTML; }
   function htmlToPlainText(html){ return html.replace(/<br\s*\/?>/gi,'\n').replace(/<[^>]+>/g,''); }
   function parseRegexList(s){ if(!s?.trim()) return []; return s.split(',').map(x=>x.trim()).filter(Boolean).map(p=>new RegExp(p,'g')); }
+
+  // 🔧 버그 수정: 올바른 객체 리터럴 사용
   function protectTokens(text, regexes){
     const placeholders=[]; let out=text;
-    regexes.forEach((rgx,i)=>{ out = out.replace(rgx,(m)=>{ const token=`__DNT_${i}_${placeholders.length}__`; placeholders.push({token:value:m}); return token; }); });
+    regexes.forEach((rgx,i)=>{
+      out = out.replace(rgx,(m)=>{
+        const token=`__DNT_${i}_${placeholders.length}__`;
+        placeholders.push({ token, value: m }); // ← 여기!
+        return token;
+      });
+    });
     return { protectedText: out, placeholders };
   }
+
   function restoreTokens(text, placeholders){ let res=text; for(const {token,value} of placeholders){ res = res.split(token).join(value); } return res; }
   function tryParseJSON(s){ if(!s?.trim()) return null; try{ return JSON.parse(s);}catch{ return null;} }
   function applyGlossaryBefore(text, gl){
@@ -295,13 +290,17 @@
   }
   function applyGlossaryAfter(text, gl){ return text; }
 
-  async function translateText(text, source, target, provider, apiKey, region, signal){
-    // 1900자 단위로 분할 + 순차 호출 (진행률 갱신을 위해 순차 유지)
+  async function translateText(text, source, target, provider, apiKey, signal){
     const parts = chunkByLines(text, 1900);
     const out = [];
     for (const part of parts){
-      const payload = { provider, apiKey, source, target, q: part, ...(region ? {region}: {}) };
-      const res = await fetch(proxyURL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload), signal });
+      const payload = { provider, apiKey, source, target, q: part };
+      const res = await fetchWithTimeout(proxyURL, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+        signal
+      }, 20000);
       const t = await res.text();
       if (!res.ok) throw new Error(`Proxy ${res.status}: ${t}`);
       const data = JSON.parse(t);
@@ -309,10 +308,24 @@
     }
     return out.join('\n');
   }
+
   function chunkByLines(s, max){
     const lines = s.split(/\n/); const chunks=[]; let cur='';
-    for (const ln of lines){ if ((cur + '\n' + ln).length > max) { chunks.push(cur); cur = ln; } else { cur = cur ? cur+'\n'+ln : ln; } }
+    for (const ln of lines){ if ((cur + '\n' + ln).length > max) { if(cur) chunks.push(cur); cur = ln; } else { cur = cur ? cur+'\n'+ln : ln; } }
     if (cur) chunks.push(cur); return chunks;
+  }
+
+  // fetch 타임아웃 보조
+  async function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
+    const externalSignal = options.signal;
+    const controller = new AbortController();
+    const signals = [controller.signal];
+    if (externalSignal) {
+      externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try { return await fetch(resource, { ...options, signal: controller.signal }); }
+    finally { clearTimeout(id); }
   }
 </script>
 </body>
