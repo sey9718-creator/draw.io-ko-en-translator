@@ -4,7 +4,6 @@
   <meta charset="UTF-8" />
   <title>draw.io Translator (KO↔EN)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- deflate/inflate -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 12px; }
@@ -90,8 +89,7 @@
 
 <script>
   // === 본인 Cloudflare Worker 주소로 교체 ===
-  // 예: https://my-worker.username.workers.dev   (/translate는 선택)
-  const proxyURL = "https://drawiotranslator.eyseong.workers.dev/";
+  const proxyURL = "https://drawiotranslator.eyseong.workers.dev/"; // /translate는 선택
 
   // DOM
   const statusEl = document.getElementById('status');
@@ -173,24 +171,51 @@
       const dntRegexes = parseRegexList(dntEl.value); // 비워도 OK
       const glossary = tryParseJSON(glossaryEl.value) || {};
 
-      // collect targets
+      // === 핵심: diagram 포맷 감지 (압축 vs 비압축) + 대상 수집 ===
       const tasks = [];
+      const diagramInfos = []; // {diagram, mode:'xml'|'base64', innerDoc}
+
       for (const diagram of diagrams) {
-        const innerXml = inflateIfNeeded(diagram.textContent || '');
+        let mode = 'base64';
+        let innerXml = '';
+        if (diagram.children && diagram.children.length > 0) {
+          // 비압축: 첫 자식(mxGraphModel)을 직렬화
+          mode = 'xml';
+          innerXml = new XMLSerializer().serializeToString(diagram.firstElementChild);
+        } else {
+          // 압축: base64 + deflateRaw
+          const data = diagram.textContent || '';
+          innerXml = inflateIfNeeded(data);
+        }
+
         const innerDoc = parser.parseFromString(innerXml, "text/xml");
+        // 1) mxCell value
         const cells = Array.from(innerDoc.getElementsByTagName('mxCell'));
         for (const cell of cells) {
           const rawVal = cell.getAttribute('value');
-          if (!rawVal) continue;
-          const plain = htmlToPlainText(decodeHtmlEntities(rawVal)).trim();
-          if (!plain) continue;
-          tasks.push({ diagram, innerDoc, cell, plain });
+          if (rawVal) {
+            const plain = htmlToPlainText(decodeHtmlEntities(rawVal)).trim();
+            if (plain) tasks.push({ kind:'mxcell-value', diagram, innerDoc, node: cell, plain });
+          }
         }
+        // 2) label 속성
+        const labelNodes = Array.from(innerDoc.querySelectorAll('[label]'));
+        for (const el of labelNodes) {
+          const rawLabel = el.getAttribute('label');
+          if (rawLabel) {
+            const plain = htmlToPlainText(decodeHtmlEntities(rawLabel)).trim();
+            if (plain) tasks.push({ kind:'attr-label', diagram, innerDoc, node: el, plain });
+          }
+        }
+        diagramInfos.push({ diagram, mode, innerDoc });
       }
 
       const total = tasks.length;
       let done = 0; updateMeter(done, total);
+      log(`대상 라벨 수: ${total}개`);
+      if (total === 0) log('⚠️ 라벨이 value/label 속성에 없을 수 있습니다. 샘플 파일 구조를 알려주시면 더 확장할게요.');
 
+      // === 번역 실행 ===
       for (const t of tasks) {
         if (aborter.signal.aborted) throw new Error('사용자 취소');
 
@@ -199,26 +224,39 @@
         const translated = await translateText(glApplied, sourceLangEl.value, targetLangEl.value, providerEl.value, apiKey, aborter.signal);
         const restored = restoreTokens(applyGlossaryAfter(translated, glossary), placeholders);
 
-        // PATCH #1: 줄바꿈 복원 + HTML 래핑으로 draw.io 라벨 보장
+        // 줄바꿈 복원 + HTML 래핑 (draw.io 라벨 보장)
         const htmlBody = restored.replace(/\n/g, '<br>');
-        t.cell.setAttribute('value', encodeHtmlEntities(`<div>${htmlBody}</div>`));
+        const wrapped = encodeHtmlEntities(`<div>${htmlBody}</div>`);
+
+        if (t.kind === 'mxcell-value') {
+          t.node.setAttribute('value', wrapped);
+        } else {
+          t.node.setAttribute('label', wrapped);
+        }
 
         done++; updateMeter(done, total);
         if (done <= 3) log(`[SAMPLE] BEFORE="${t.plain.slice(0,60)}"  AFTER="${restored.slice(0,60)}"`);
         if (done % 10 === 0) log(`진행: ${done}/${total}`);
       }
 
-      // diagram별로 재압축 후 반영
-      const byDiagram = new Map();
-      for (const t of tasks) if (!byDiagram.has(t.diagram)) byDiagram.set(t.diagram, t.innerDoc);
-      for (const [diagram, innerDoc] of byDiagram.entries()) {
-        const newInnerXml = new XMLSerializer().serializeToString(innerDoc.documentElement);
-        diagram.textContent = deflateToBase64(newInnerXml);
+      // === diagram 반영 (모드별) ===
+      for (const info of diagramInfos) {
+        const newInnerXml = new XMLSerializer().serializeToString(info.innerDoc.documentElement);
+        if (info.mode === 'base64') {
+          // 압축: base64로 저장 + 루트 compressed=true
+          info.diagram.textContent = deflateToBase64(newInnerXml);
+          const root = doc.documentElement;
+          if (root && root.tagName === 'mxfile') root.setAttribute('compressed', 'true');
+        } else {
+          // 비압축: 기존 첫 자식을 새 문서 엘리먼트로 교체
+          const replacement = parser.parseFromString(newInnerXml, "text/xml").documentElement;
+          // 안전 교체
+          const old = info.diagram.firstElementChild;
+          if (old) info.diagram.replaceChild(replacement, old);
+          else info.diagram.appendChild(replacement);
+          // 비압축 모드면 compressed 속성은 제거/false 유지(굳이 안 건드려도 draw.io가 읽습니다)
+        }
       }
-
-      // PATCH #2: 루트에 compressed="true" 강제 (압축 표식)
-      const root = doc.documentElement;
-      if (root && root.tagName === 'mxfile') root.setAttribute('compressed', 'true');
 
       translatedXmlText = new XMLSerializer().serializeToString(doc);
       status("번역 완료!");
@@ -268,7 +306,6 @@
   function htmlToPlainText(html){ return html.replace(/<br\s*\/?>/gi,'\n').replace(/<[^>]+>/g,''); }
   function parseRegexList(s){ if(!s?.trim()) return []; return s.split(',').map(x=>x.trim()).filter(Boolean).map(p=>new RegExp(p,'g')); }
 
-  // PATCH: 버그 수정 (올바른 객체 리터럴)
   function protectTokens(text, regexes){
     const placeholders=[]; let out=text;
     regexes.forEach((rgx,i)=>{
@@ -287,16 +324,11 @@
   }
   function applyGlossaryAfter(text, gl){ return text; }
 
-  // JSON 안전 파서
   function safeJsonParse(text) {
     try { return JSON.parse(text); }
-    catch (e) {
-      const head = String(text).slice(0, 200);
-      throw new Error("Proxy returned non-JSON (head): " + head);
-    }
+    catch (e) { const head = String(text).slice(0, 200); throw new Error("Proxy returned non-JSON (head): " + head); }
   }
 
-  // 번역 호출 (청크 + 타임아웃 + 취소)
   async function translateText(text, source, target, provider, apiKey, signal){
     const parts = chunkByLines(text, 1900);
     const out = [];
@@ -322,7 +354,6 @@
     if (cur) chunks.push(cur); return chunks;
   }
 
-  // fetch 타임아웃 보조
   async function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
     const externalSignal = options.signal;
     const controller = new AbortController();
