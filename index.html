@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <title>draw.io Translator (KO↔EN)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- deflate/inflate -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 12px; }
@@ -18,7 +19,7 @@
     .bad{ color:#c33; font-size:12px; }
     .progress { height:10px; background:#eee; border-radius:999px; overflow:hidden; margin-top:8px; }
     .bar { height:100%; width:0%; background:#4f46e5; transition: width .2s ease; }
-    pre#log { background:#0b1020; color:#d6e1ff; padding:10px; border-radius:8px; height:180px; overflow:auto; font-size:12px; }
+    pre#log { background:#0b1020; color:#d6e1ff; padding:10px; border-radius:8px; height:200px; overflow:auto; font-size:12px; }
   </style>
 </head>
 <body>
@@ -88,10 +89,11 @@
 </div>
 
 <script>
-  // === 꼭 본인 Cloudflare Worker 주소로 교체 ===
-  // /translate 붙일 필요 없습니다. Cloudflare가 알려준 주소 그대로 OK.
+  // === 본인 Cloudflare Worker 주소로 교체 ===
+  // 예: https://my-worker.username.workers.dev   (/translate는 선택)
   const proxyURL = "https://drawiotranslator.eyseong.workers.dev/";
 
+  // DOM
   const statusEl = document.getElementById('status');
   const fileEl = document.getElementById('file');
   const translateBtn = document.getElementById('translateBtn');
@@ -110,18 +112,20 @@
   const meter = document.getElementById('meter');
   const logEl = document.getElementById('log');
 
+  // state
   let originalXmlText = null;
   let translatedXmlText = null;
   let aborter = null;
 
-  // 전역 에러도 화면에 찍기
+  // global error log
   window.addEventListener('error', (e) => log(`[window.error] ${e.message}`));
   window.addEventListener('unhandledrejection', (e) => log(`[promise.reject] ${e.reason}`));
 
-  // 세션 저장/복원
+  // session key keep
   apiKeyEl.value = sessionStorage.getItem('DRAWIO_TR_KEY') || '';
   apiKeyEl.addEventListener('input', () => sessionStorage.setItem('DRAWIO_TR_KEY', apiKeyEl.value || '') );
 
+  // load file
   fileEl.addEventListener('change', async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -129,13 +133,12 @@
     status("파일 로드 완료");
   });
 
-  // 프록시/키 간단 점검
+  // proxy quick test
   testProxyBtn.addEventListener('click', async () => {
     try {
       if (!/^https?:\/\//i.test(proxyURL)) return status("proxyURL이 비어있습니다. 먼저 설정하세요.", true);
       const apiKey = apiKeyEl.value.trim();
       if (!apiKey) return status("API 키를 먼저 입력하세요", true);
-
       const body = { provider: providerEl.value, apiKey, source: "KO", target: "EN", q: "안녕하세요" };
       const res = await fetchWithTimeout(proxyURL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }, 15000);
       const txt = await res.text();
@@ -148,6 +151,7 @@
     }
   });
 
+  // translate
   translateBtn.addEventListener('click', async () => {
     resetProgress();
     try {
@@ -159,19 +163,17 @@
       if (sourceLangEl.value === targetLangEl.value) return status("Source/Target을 다르게 설정하세요", true);
 
       aborter = new AbortController();
-      cancelBtn.disabled = false;
-      translateBtn.disabled = true;
-      downloadBtn.disabled = true;
+      cancelBtn.disabled = false; translateBtn.disabled = true; downloadBtn.disabled = true;
 
       const parser = new DOMParser();
       const doc = parser.parseFromString(originalXmlText, "text/xml");
       const diagrams = Array.from(doc.getElementsByTagName('diagram'));
       if (diagrams.length === 0) return status("diagram 노드를 찾지 못했습니다.", true);
 
-      const dntRegexes = parseRegexList(dntEl.value); // 비어 있어도 OK
+      const dntRegexes = parseRegexList(dntEl.value); // 비워도 OK
       const glossary = tryParseJSON(glossaryEl.value) || {};
 
-      // 번역 대상 수집
+      // collect targets
       const tasks = [];
       for (const diagram of diagrams) {
         const innerXml = inflateIfNeeded(diagram.textContent || '');
@@ -182,41 +184,41 @@
           if (!rawVal) continue;
           const plain = htmlToPlainText(decodeHtmlEntities(rawVal)).trim();
           if (!plain) continue;
-          tasks.push({ diagram, innerDoc, cell });
+          tasks.push({ diagram, innerDoc, cell, plain });
         }
       }
 
       const total = tasks.length;
       let done = 0; updateMeter(done, total);
 
-      // 실행
       for (const t of tasks) {
         if (aborter.signal.aborted) throw new Error('사용자 취소');
 
-        const rawVal = t.cell.getAttribute('value');
-        const htmlDecoded = decodeHtmlEntities(rawVal);
-        const plainText = htmlToPlainText(htmlDecoded).trim();
-
-        const {protectedText, placeholders} = protectTokens(plainText, dntRegexes);
+        const { protectedText, placeholders } = protectTokens(t.plain, dntRegexes);
         const glApplied = applyGlossaryBefore(protectedText, glossary);
         const translated = await translateText(glApplied, sourceLangEl.value, targetLangEl.value, providerEl.value, apiKey, aborter.signal);
         const restored = restoreTokens(applyGlossaryAfter(translated, glossary), placeholders);
 
-        t.cell.setAttribute('value', encodeHtmlEntities(restored));
+        // PATCH #1: 줄바꿈 복원 + HTML 래핑으로 draw.io 라벨 보장
+        const htmlBody = restored.replace(/\n/g, '<br>');
+        t.cell.setAttribute('value', encodeHtmlEntities(`<div>${htmlBody}</div>`));
 
         done++; updateMeter(done, total);
+        if (done <= 3) log(`[SAMPLE] BEFORE="${t.plain.slice(0,60)}"  AFTER="${restored.slice(0,60)}"`);
         if (done % 10 === 0) log(`진행: ${done}/${total}`);
       }
 
-      // diagram별 반영
+      // diagram별로 재압축 후 반영
       const byDiagram = new Map();
-      for (const t of tasks) {
-        if (!byDiagram.has(t.diagram)) byDiagram.set(t.diagram, t.innerDoc);
-      }
+      for (const t of tasks) if (!byDiagram.has(t.diagram)) byDiagram.set(t.diagram, t.innerDoc);
       for (const [diagram, innerDoc] of byDiagram.entries()) {
         const newInnerXml = new XMLSerializer().serializeToString(innerDoc.documentElement);
         diagram.textContent = deflateToBase64(newInnerXml);
       }
+
+      // PATCH #2: 루트에 compressed="true" 강제 (압축 표식)
+      const root = doc.documentElement;
+      if (root && root.tagName === 'mxfile') root.setAttribute('compressed', 'true');
 
       translatedXmlText = new XMLSerializer().serializeToString(doc);
       status("번역 완료!");
@@ -234,11 +236,7 @@
   });
 
   cancelBtn.addEventListener('click', () => {
-    if (aborter) {
-      aborter.abort();
-      status("취소 요청됨(잠시 후 중단).", true);
-      log("[USER] Abort requested");
-    }
+    if (aborter) { aborter.abort(); status("취소 요청됨(잠시 후 중단).", true); log("[USER] Abort requested"); }
   });
 
   downloadBtn.addEventListener('click', () => {
@@ -270,19 +268,18 @@
   function htmlToPlainText(html){ return html.replace(/<br\s*\/?>/gi,'\n').replace(/<[^>]+>/g,''); }
   function parseRegexList(s){ if(!s?.trim()) return []; return s.split(',').map(x=>x.trim()).filter(Boolean).map(p=>new RegExp(p,'g')); }
 
-  // 🔧 버그 수정: 올바른 객체 리터럴 사용
+  // PATCH: 버그 수정 (올바른 객체 리터럴)
   function protectTokens(text, regexes){
     const placeholders=[]; let out=text;
     regexes.forEach((rgx,i)=>{
       out = out.replace(rgx,(m)=>{
         const token=`__DNT_${i}_${placeholders.length}__`;
-        placeholders.push({ token, value: m }); // ← 여기!
+        placeholders.push({ token, value: m });
         return token;
       });
     });
     return { protectedText: out, placeholders };
   }
-
   function restoreTokens(text, placeholders){ let res=text; for(const {token,value} of placeholders){ res = res.split(token).join(value); } return res; }
   function tryParseJSON(s){ if(!s?.trim()) return null; try{ return JSON.parse(s);}catch{ return null;} }
   function applyGlossaryBefore(text, gl){
@@ -290,6 +287,16 @@
   }
   function applyGlossaryAfter(text, gl){ return text; }
 
+  // JSON 안전 파서
+  function safeJsonParse(text) {
+    try { return JSON.parse(text); }
+    catch (e) {
+      const head = String(text).slice(0, 200);
+      throw new Error("Proxy returned non-JSON (head): " + head);
+    }
+  }
+
+  // 번역 호출 (청크 + 타임아웃 + 취소)
   async function translateText(text, source, target, provider, apiKey, signal){
     const parts = chunkByLines(text, 1900);
     const out = [];
@@ -303,7 +310,7 @@
       }, 20000);
       const t = await res.text();
       if (!res.ok) throw new Error(`Proxy ${res.status}: ${t}`);
-      const data = JSON.parse(t);
+      const data = safeJsonParse(t);
       out.push(data.translatedText || '');
     }
     return out.join('\n');
@@ -319,10 +326,7 @@
   async function fetchWithTimeout(resource, options = {}, timeoutMs = 20000) {
     const externalSignal = options.signal;
     const controller = new AbortController();
-    const signals = [controller.signal];
-    if (externalSignal) {
-      externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
-    }
+    if (externalSignal) externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
     const id = setTimeout(() => controller.abort(), timeoutMs);
     try { return await fetch(resource, { ...options, signal: controller.signal }); }
     finally { clearTimeout(id); }
